@@ -1,1 +1,717 @@
-qq
+# ============================================
+# LAYER 0: RAW TRANSCRIPT SNAPSHOT
+# Production version - 每日运行
+# ============================================
+
+import pandas as pd
+import pyodbc
+import numpy as np
+from datetime import datetime
+import warnings
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from itertools import islice
+import re
+import html
+from pathlib import Path
+import torch
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+warnings.filterwarnings('ignore')
+
+# ============================================
+# CONFIGURATION
+# ============================================
+
+SERVER = 'PRDRSHHISTSQL' #'PRDRSHTRIALSQL'
+DATABASE = 'StreetEvents'
+DRIVER = '{ODBC Driver 17 for SQL Server}'
+CONN_STR = (
+    f'Driver={DRIVER};'
+    f'Server={SERVER};'
+    f'Database={DATABASE};'
+    f'Trusted_Connection=yes;'
+)
+
+#UNIVERSE_PATH = '/data09/home/aw_shared/univ_data.parquet'
+UNIVERSE_PATH = '/data09/home/aw_shared/prod/univ_merged' 
+OUTPUT_DIR = '/data09/home/aw_shared/prod/daily_meta_embedding'
+
+# Embedding configuration
+MODEL_NAME = "intfloat/e5-base-v2"
+EMBEDDING_BATCH_SIZE = 64  # 每次 encode 的 batch size
+THREADS_PER_WORKER = 8     # 每个进程的线程数
+
+# Load universe once (global)
+# df_univ = pd.read_parquet(UNIVERSE_PATH)
+# df_univ['date'] = pd.to_datetime(df_univ['date'])
+def load_universe(univ_dir):
+    files = sorted(Path(univ_dir).glob("*.parquet"))
+    dfs = [pd.read_parquet(f) for f in files]
+    univ = pd.concat(dfs, ignore_index=True)
+    univ['date'] = pd.to_datetime(univ['date'])
+    univ = univ.sort_values('date').reset_index(drop=True)
+    return univ
+df_univ = load_universe(UNIVERSE_PATH)
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def get_next_trading_day(T, df_univ):
+    dates = df_univ['date'].sort_values().unique()
+    T = pd.to_datetime(T).normalize()
+    idx = np.searchsorted(dates, T)
+    if idx + 1 < len(dates):
+        return dates[idx + 1]
+    else:
+        return T + pd.offsets.BDay(1)
+
+def fetch_transcript_snapshot_for_date(T):
+    T = pd.to_datetime(T).normalize()
+    T_next = get_next_trading_day(T, df_univ)
+    print(f"Transcript snapshot for {T.date()}")
+    sql_query = f"""
+    SELECT
+        EventId, CompanyTicker, CompanyId, Sedol, Isin, Cusip,StartDateEST, DataDate, LastUpdateEST, 
+        EventTypeName, EventStoryVersion, Headline, Contents, EventTypeId, IsBackfill
+    FROM
+        StreetEvents..StreetEventsTranscript
+    WHERE
+        EventTypeId = 1
+        AND DataDate >= '{T:%Y-%m-%d}'
+        AND DataDate <= '{T_next:%Y-%m-%d}'
+    """
+    with pyodbc.connect(CONN_STR, timeout=30) as conn:
+        df = pd.read_sql(sql_query, conn)
+    if df.empty:
+        print(f" No transcripts for {T.date()}")
+        return df
+   # return df
+    
+    df['StartDateEST'] = pd.to_datetime(df['StartDateEST'])
+    df['DataDate'] = pd.to_datetime(df['DataDate'])
+    df['LastUpdateEST'] = pd.to_datetime(df['LastUpdateEST'])
+    return df
+
+
+def map_to_universe(df_transcript, T):
+    if df_transcript.empty:
+        return df_transcript
+    T = pd.to_datetime(T).normalize()
+    T_next = get_next_trading_day(T, df_univ)
+    T_plus_1_930 = T_next + pd.Timedelta(hours=9, minutes=30)
+    
+    #universe for date T
+    df_univ_T = df_univ[df_univ['date'] == T].copy()
+    if df_univ_T.empty:
+        print(f" No universe data for {T.date()}")
+        return pd.DataFrame()
+        
+    # Sedol_6
+    df_univ_T['Sedol_6'] = (df_univ_T['Sedol'].astype(str).str.strip().str.upper().str[:6])
+    df_transcript['Sedol_6'] = (df_transcript['Sedol'].astype(str).str.strip().str.upper().str[:6])
+    
+    # merge
+    df_univ_T['cutoff_time'] = T_plus_1_930
+    df_univ_T = df_univ_T.sort_values(['cutoff_time','Sedol_6'])
+    df_transcript = df_transcript.sort_values([ 'LastUpdateEST','Sedol_6'])
+
+    df_mapped = pd.merge_asof(df_univ_T, df_transcript, by='Sedol_6',
+        left_on='cutoff_time',
+        right_on='LastUpdateEST',
+        direction='backward',
+        allow_exact_matches=True) #for univ T, match most recent call LastUpdateEST <= cutoff_time
+    
+    df_mapped['date'] = T
+    return df_mapped
+
+
+# ============================================
+# STEP 2: BUILD META.PARQUET
+# ============================================
+
+
+def build_meta_parquet(df_mapped: pd.DataFrame, T: str):
+    """
+    Build meta.parquet (你同事要 check 的文件)
+    
+    Args:
+        df_mapped: DataFrame from map_to_universe
+        T: str, 'YYYY-MM-DD'
+        
+    Returns:
+        DataFrame with meta information
+    """
+    if df_mapped.empty:
+        return df_mapped
+    
+    meta_cols = [
+        'date',
+        'PointID',
+        'Sedol_6',  # ✅ 改：用 Sedol_6 替代 Sedol
+        'EventId',
+        'CompanyTicker',
+        'CompanyId',
+        'StartDateEST',
+        'DataDate',
+        'LastUpdateEST',
+        'EventStoryVersion',
+        'EventTypeId',
+    ]
+    
+    meta = df_mapped[meta_cols].copy()
+    
+    #print(f"📋 Meta built: {len(meta):,} records ({meta['EventId'].notna().sum():,} with calls)")
+    
+    return meta
+
+# ============================================
+# STEP 3: TEXT PROCESSING
+# ============================================
+
+def process_transcript_step0(text):
+    """清理 transcript"""
+    if not isinstance(text, str):
+        return pd.Series(['', ''])
+
+    split_pattern = r"={10,}\s*Presentation\s*-{10,}"
+    match = re.search(split_pattern, text, re.IGNORECASE)
+    
+    headline_text = ""
+    content_text = text 
+
+    if match:
+        split_idx = match.start()
+        raw_headline = text[:split_idx]
+        content_text = text[match.end():]
+        
+        participants_pattern = r"={10,}\s*Corporate Participants"
+        part_match = re.search(participants_pattern, raw_headline, re.IGNORECASE)
+        
+        if part_match:
+            headline_text = raw_headline[:part_match.start()].strip()
+        else:
+            headline_text = raw_headline.strip()
+    else:
+        headline_text = ""
+        content_text = text            
+
+    content_text = html.unescape(content_text)
+    
+    # Delete Operator chunks
+    operator_pattern_with_lines = r'-{10,}\s*Operator\s*\[\d+\]\s*-{10,}(.*?)(?=-{10,}|\Z)'
+    content_text = re.sub(operator_pattern_with_lines, '', content_text, flags=re.DOTALL | re.IGNORECASE)
+    
+    operator_pattern_no_prefix = r'^\s*Operator\s*\[\d+\]\s*-{10,}(.*?)(?=-{10,}|\Z)'
+    content_text = re.sub(operator_pattern_no_prefix, '', content_text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+
+    # Drop separators
+    content_text = re.sub(r'={10,}', '', content_text)
+    content_text = re.sub(r'-{10,}', '', content_text)
+    content_text = re.sub(r'\[\d+\]', '', content_text)
+    content_text = re.sub(r'\n\s*\n+', '\n\n', content_text).strip()
+    
+    headline_text = html.unescape(headline_text).strip()
+
+    return pd.Series([headline_text, content_text], index=['headline_from_content', 'contents_cleaned'])
+
+
+def detect_qa_section(text):
+    """检测是否有 Q&A section"""
+    if not isinstance(text, str):
+        return False
+    
+    qa_patterns = [
+        r'Questions?\s+and\s+Answers?',
+        r'Q\s*&?\s*A', 
+        r'Question[s]?[\s-]and[\s-]Answer[s]?\s+Session',
+        r'\n\s*Questions?\s+and\s+Answers?\s*\n',
+    ]
+
+    for pattern in qa_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    
+    return False
+
+
+def split_presentation_qa(row):
+    """分离 Presentation 和 Q&A"""
+    text = row['contents_cleaned']  
+    has_qa = row['has_qa']
+    
+    if not has_qa or not isinstance(text, str):
+        return pd.Series([text, None])
+    
+    qa_patterns = [
+        r'Questions?\s+and\s+Answers?',
+        r'Q\s*&?\s*A', 
+        r'Question[s]?[\s-]and[\s-]Answer[s]?\s+Session',
+        r'\n\s*Questions?\s+and\s+Answers?\s*\n',
+    ]
+    
+    for pattern in qa_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            split_pos = match.start()
+            presentation = text[:split_pos].strip()
+            qa = text[split_pos:].strip()
+            return pd.Series([presentation, qa])
+    
+    return pd.Series([text, None])
+
+
+SPEAKER_PATTERN = re.compile(
+    r'^[A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)*,\s+.*-\s+.*$')
+
+def merge_speaker_blocks(text: str) -> list:
+    """合并 speaker blocks"""
+    blocks = []
+    current_lines = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if SPEAKER_PATTERN.match(line):
+            if current_lines:
+                blocks.append(" ".join(current_lines))
+                current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        blocks.append(" ".join(current_lines))
+
+    return blocks
+
+
+# ============================================
+# STEP 4: CHUNKING (使用你的并行逻辑)
+# ============================================
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1024,
+    chunk_overlap=128,
+    length_function=len,
+    separators=["\n\n", ". ", "\n", " ", ""]
+)
+
+
+def process_batch_chunking(batch):
+    """处理一个 batch 的 chunking（用于并行）"""
+    out = []
+    for idx, row in batch:
+        text = row['Presentation']
+        if pd.isna(text) or not text.strip():
+            continue
+
+        # Merge speaker blocks
+        blocks = merge_speaker_blocks(text)
+
+        chunks = []
+        for block in blocks:
+            chunks.extend(text_splitter.split_text(block))
+
+        out.extend([
+            {
+                "original_index": idx,
+                "chunk_seq_id": i,
+                "chunk_text": chunk,
+                "EventId": row['EventId'],
+               # "Sedol": row['Sedol'],
+                "Sedol_6": row['Sedol_6'],
+                "StartDateEST": row['StartDateEST'],
+                "LastUpdateEST": row['LastUpdateEST'],
+                "DataDate": row['DataDate']
+            }
+            for i, chunk in enumerate(chunks)
+        ])
+
+    return out
+
+
+def batch_iterator(iterable, batch_size):
+    """生成 batch iterator"""
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, batch_size))
+        if not batch:
+            break
+        yield batch
+
+
+def chunk_presentations(df_mapped: pd.DataFrame):
+    """
+    Chunk presentations（使用你的并行逻辑）
+    
+    对于 daily production：
+    - 如果 calls < 100: 不并行（overhead 大于收益）
+    - 如果 calls >= 100: 使用并行加速
+    """
+    # 只处理有 call 的记录
+    df_with_calls = df_mapped[df_mapped['EventId'].notna()].copy()
+    
+    if df_with_calls.empty:
+        print(" No calls to chunk")
+        return pd.DataFrame()
+    
+   # print(f"\n📝 Chunking {len(df_with_calls):,} presentations...")
+    
+    # 决定是否并行
+    USE_PARALLEL = len(df_with_calls) >= 100
+    
+    if USE_PARALLEL:
+        # 并行处理（你的原始逻辑）
+        indexed_data = list(df_with_calls.iterrows())
+        BATCH_SIZE = 32
+        batches = list(batch_iterator(indexed_data, BATCH_SIZE))
+        
+        n_workers = min(16, max(1, cpu_count() - 2))  # Daily 不需要太多 workers
+        #print(f"   Using {n_workers} workers, batch_size={BATCH_SIZE}")
+        
+        all_chunks = []
+        with Pool(n_workers) as pool:
+            for batch_result in tqdm(
+                pool.imap(process_batch_chunking, batches, chunksize=1),
+                total=len(batches),
+                desc="Chunking"
+            ):
+                all_chunks.extend(batch_result)
+        
+        df_chunks = pd.DataFrame(all_chunks)
+    
+    else:
+        # 串行处理（小数据量更快）
+       # print(f"   Using serial processing (small dataset)")
+        all_chunks = []
+        
+        for idx, row in tqdm(df_with_calls.iterrows(), total=len(df_with_calls), desc="Chunking"):
+            text = row['Presentation']
+            if pd.isna(text) or not text.strip():
+                continue
+            
+            blocks = merge_speaker_blocks(text)
+            chunks = []
+            for block in blocks:
+                chunks.extend(text_splitter.split_text(block))
+            
+            for i, chunk in enumerate(chunks):
+                all_chunks.append({
+                    'EventId': row['EventId'],
+                    #'Sedol': row['Sedol'],
+                    'Sedol_6': row['Sedol_6'],
+                    'StartDateEST': row['StartDateEST'],
+                    'LastUpdateEST': row['LastUpdateEST'],
+                    'DataDate': row['DataDate'],
+                    'chunk_seq_id': i,
+                    'chunk_text': chunk
+                })
+        
+        df_chunks = pd.DataFrame(all_chunks)
+    
+    #print(f"✅ Created {len(df_chunks):,} chunks from {df_chunks['EventId'].nunique():,} events")
+    # if len(df_chunks) > 0:
+    #     print(f"   Avg chunks per event: {len(df_chunks)/df_chunks['EventId'].nunique():.1f}")
+    
+    return df_chunks
+
+
+# ============================================
+# STEP 5: GENERATE EMBEDDINGS (简化版，无 checkpoint)
+# ============================================
+
+def process_embedding_batch(args):
+    """
+    处理一个 batch 的 embedding（用于并行）
+    
+    Args:
+        args: tuple of (batch_id, batch_data)
+              batch_data 是 DataFrame，包含 texts 和其他列
+    """
+    batch_id, batch_df = args  # ✅ 改：接收 DataFrame 而不是 texts
+    
+    # 设置线程数
+    torch.set_num_threads(THREADS_PER_WORKER)
+    
+    # 加载模型（每个进程独立加载）
+    model = SentenceTransformer(MODEL_NAME, device='cpu')
+    
+    # 添加 "passage: " prefix
+    texts_with_prefix = ["passage: " + str(t) for t in batch_df['chunk_text'].tolist()]
+    
+    # 生成 embeddings
+    embeddings = model.encode(
+        texts_with_prefix,
+        batch_size=EMBEDDING_BATCH_SIZE,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+    
+    # ✅ 改：返回 DataFrame 而不是只返回 embeddings
+    batch_df['embedding'] = [emb.tolist() for emb in embeddings]
+    
+    return batch_id, batch_df
+
+def generate_embeddings(df_chunks: pd.DataFrame):
+    """生成 embeddings"""
+    if df_chunks.empty:
+        print(" No chunks to embed")
+        return pd.DataFrame(columns=['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST', 'chunk_seq_id', 'embedding'])
+    
+    #print(f"\n🔄 Generating embeddings for {len(df_chunks):,} chunks...")
+    
+    USE_PARALLEL = len(df_chunks) >= 1000
+    
+    if USE_PARALLEL:
+        # 并行处理
+        BATCH_SIZE = 500
+        n_batches = (len(df_chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+        n_workers = min(8, max(1, cpu_count() // 2))
+        
+       # print(f"   Using {n_workers} workers, {n_batches} batches")
+        
+        # ✅ 改：准备 batches - 传递 DataFrame 而不是 texts
+        tasks = []
+        for i in range(n_batches):
+            start_idx = i * BATCH_SIZE
+            end_idx = min((i + 1) * BATCH_SIZE, len(df_chunks))
+            batch_df = df_chunks.iloc[start_idx:end_idx].copy()  # ✅ 传递整个 DataFrame
+            tasks.append((i, batch_df))
+        
+        # 并行处理
+        results = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(process_embedding_batch, task): task[0] for task in tasks}
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Embedding"):
+                batch_id, batch_df = future.result()  # ✅ 改：接收 DataFrame
+                results[batch_id] = batch_df
+        
+        # ✅ 改：合并结果 - concat DataFrames
+        all_batches = [results[i] for i in range(n_batches)]
+        df_embeddings = pd.concat(all_batches, ignore_index=True)
+    
+    else:
+        # 串行处理
+       # print(f"   Using serial processing (small dataset)")
+        
+        model = SentenceTransformer(MODEL_NAME, device='cpu')
+        texts = ["passage: " + str(t) for t in df_chunks['chunk_text'].tolist()]
+        
+        embeddings = model.encode(
+            texts,
+            batch_size=EMBEDDING_BATCH_SIZE,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        
+        df_chunks['embedding'] = [emb.tolist() for emb in embeddings]
+        df_embeddings = df_chunks.copy()  # ✅ 改：保留所有列
+    
+    # ✅ 改：选择需要的列
+    df_embeddings = df_embeddings[['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST', 'chunk_seq_id', 'embedding']].copy()
+    
+  #  print(f"✅ Generated {len(df_embeddings):,} embeddings")
+   # print(f"   Embedding dimension: {len(df_embeddings['embedding'].iloc[0])}")
+    
+    return df_embeddings
+
+# ============================================
+# STEP 6: SAVE OUTPUTS
+# ============================================
+
+def save_outputs(meta: pd.DataFrame, embeddings: pd.DataFrame, T: str):
+    """Save meta.parquet and embeddings.parquet"""
+    import os
+    
+    # ✅ 改：创建子目录
+    meta_dir = f"{OUTPUT_DIR}/meta"
+    emb_dir = f"{OUTPUT_DIR}/embeddings"
+    os.makedirs(meta_dir, exist_ok=True)
+    os.makedirs(emb_dir, exist_ok=True)
+    
+    date_str = pd.to_datetime(T).strftime('%Y%m%d')
+    
+    # ✅ 改：保存到子目录，文件名只用日期
+    meta_path = f"{meta_dir}/{date_str}.parquet"
+    meta.to_parquet(meta_path, index=False)
+   # print(f"\n💾 Saved meta: {meta_path}")
+    #print(f"   Size: {len(meta):,} records")
+    
+    # Save embeddings
+    if not embeddings.empty:
+        emb_path = f"{emb_dir}/{date_str}.parquet"
+        embeddings.to_parquet(emb_path, index=False)
+      #  print(f"💾 Saved embeddings: {emb_path}")
+      #  print(f"   Size: {len(embeddings):,} chunks")
+    else:
+        emb_path = None
+       # print(f"ℹ️ No embeddings to save")
+    
+    return meta_path, emb_path
+
+# ============================================
+# MAIN PIPELINE
+# ============================================
+
+def run_daily_snapshot(T: str):
+    """
+    主函数：运行完整的 daily snapshot pipeline
+    
+    Args:
+        T: str, 'YYYY-MM-DD' - trading date (EOD)
+        
+    Returns:
+        tuple: (meta_path, embeddings_path)
+    """
+    # print(f"\n{'#'*80}")
+    # print(f"# LAYER 0 SNAPSHOT PIPELINE")
+   # print(f"Date: {T}")
+    #print(f"{'-'*80}")
+    
+    # Step 1: Fetch raw transcripts
+    df_transcript = fetch_transcript_snapshot_for_date(T)
+    
+    # Step 2: Map to universe
+    df_mapped = map_to_universe(df_transcript, T)
+    if df_mapped.empty:
+        print(f"\n⚠️ No universe data for {T}, skipping...")
+        return None, None
+    
+    # Step 3: Build meta
+    meta = build_meta_parquet(df_mapped, T)
+    
+    # 如果没有任何 calls，直接保存 meta 并返回
+    if df_mapped['EventId'].notna().sum() == 0:
+        #print(f"\nℹ️ No calls for {T}, saving meta only...")
+        meta_path = save_outputs(meta, pd.DataFrame(), T)[0]
+        return meta_path, None
+    
+    # Step 4: Clean transcripts (只处理有 call 的)
+   # print(f"\n🧹 Cleaning transcripts...")
+    df_with_calls = df_mapped[df_mapped['Contents'].notna()].copy()
+    df_result = df_with_calls['Contents'].apply(process_transcript_step0)
+    df_with_calls = pd.concat([df_with_calls, df_result], axis=1)
+    
+    # Step 5: Detect QA
+   # print(f"🔍 Detecting Q&A sections...")
+    df_with_calls['has_qa'] = df_with_calls['contents_cleaned'].apply(detect_qa_section)
+  #  print(f"   Has Q&A: {df_with_calls['has_qa'].sum()} / {len(df_with_calls)}")
+    
+    # Step 6: Split presentation and QA
+  #  print(f"✂️ Splitting presentation and Q&A...")
+    result = df_with_calls.apply(split_presentation_qa, axis=1)
+    df_with_calls[['Presentation', 'QA']] = result
+    
+    # 更新 df_mapped
+    df_mapped.loc[df_with_calls.index, ['contents_cleaned', 'has_qa', 'Presentation', 'QA']] = \
+        df_with_calls[['contents_cleaned', 'has_qa', 'Presentation', 'QA']]
+    
+    # Step 7: Chunk presentations
+    df_chunks = chunk_presentations(df_mapped)
+    
+    # Step 8: Generate embeddings
+    if not df_chunks.empty:
+        embeddings = generate_embeddings(df_chunks)
+    else:
+        embeddings = pd.DataFrame()
+    
+    # Step 9: Save outputs
+    meta_path, emb_path = save_outputs(meta, embeddings, T)
+    
+    # print(f"\n{'='*80}")
+    # print(f"✅ PIPELINE COMPLETED FOR {T}")
+    # print(f"{'='*80}")
+    # print(f"Meta records: {len(meta):,}")
+    # print(f"Embedding chunks: {len(embeddings):,}")
+    
+    return meta_path, emb_path
+
+
+# ============================================
+# BATCH PROCESSING
+# ============================================
+
+def run_batch_snapshots(start_date, end_date):
+    """批量运行多个日期"""
+    # 使用 universe 的实际交易日
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+    date_range = df_univ[(df_univ['date'] >= start_date) & 
+                         (df_univ['date'] <= end_date)]['date'].unique()
+    date_range = sorted(date_range)
+    
+    print(f"\n{'='*80}")
+    print(f"BATCH PROCESSING")
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"{'='*80}")
+    
+    results = []
+    
+    for date in date_range:
+        date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+        
+        try:
+            meta_path, emb_path = run_daily_snapshot(date_str)
+            results.append({
+                'date': date_str,
+                'status': 'success' if meta_path else 'no_data',
+                'meta_path': meta_path,
+                'emb_path': emb_path
+            })
+        except Exception as e:
+            print(f"\n Failed for {date_str}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            results.append({
+                'date': date_str,
+                'status': 'failed',
+                'error': str(e)
+            })
+            continue
+    
+    # Summary
+    df_results = pd.DataFrame(results)
+    # print(f"\n{'='*80}")
+    # print(f"BATCH PROCESSING SUMMARY")
+    # print(f"{'='*80}")
+    # print(df_results['status'].value_counts())
+    
+    # Save results
+    # results_path = f"{OUTPUT_DIR}/batch_results.csv"
+    # df_results.to_csv(results_path, index=False)
+   # print(f"\n💾 Batch results saved to: {results_path}")
+    
+    return df_results
+
+
+# ============================================
+# USAGE
+# ============================================
+
+if __name__ == "__main__":
+    
+#    # Single date
+#     T = '2024-01-17'
+#     meta_path, emb_path = run_daily_snapshot(T)
+    
+  #  Batch processing
+    # results = run_batch_snapshots(
+    #     #start_date='2015-01-01',
+    #     start_date='2025-12-29',
+    #     end_date='2026-02-06'
+    # )
+    results = run_batch_snapshots(
+        #start_date='2015-01-01',
+        # start_date='2025-12-27',
+        # end_date='2025-12-30'
+        start_date='2026-02-10',
+        end_date='2026-02-10'
+    )
