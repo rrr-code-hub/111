@@ -715,3 +715,966 @@ if __name__ == "__main__":
         start_date='2026-02-10',
         end_date='2026-02-10'
     )
+
+
+
+
+model：
+import pandas as pd
+import numpy as np
+import random
+import statsmodels.api as sm
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pandas.tseries.offsets import BDay
+import scipy.optimize as optimize
+import pyodbc
+from tqdm.notebook import tqdm
+from scipy import stats
+
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from tqdm import tqdm
+
+# ============================================
+# PRODUCTION MODEL TRAINING & TESTING
+# ============================================
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import random
+from pathlib import Path
+from sklearn.metrics import r2_score
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# # ============================================
+# # CONFIGURATION
+# # ============================================
+
+# ============================================
+# STEP 1: LOAD AND MERGE META DATA
+# ============================================
+def load_universe(univ_dir):
+    files = sorted(Path(univ_dir).glob("*.parquet"))
+    # if not files:
+    #     raise ValueError(f"No universe parquet files found in {univ_dir}")
+
+    dfs = [pd.read_parquet(f) for f in files]
+    univ = pd.concat(dfs, ignore_index=True)
+
+    # if 'date' not in univ.columns:
+    #     raise ValueError("Universe schema error: 'date' column not found")
+
+    univ['date'] = pd.to_datetime(univ['date'])
+    univ = univ.sort_values('date').reset_index(drop=True)
+    return univ
+
+def load_and_merge_meta(meta_dir, start_date, end_date):
+    """
+    加载并合并指定日期范围内的所有 meta 文件
+    
+    Args:
+        meta_dir: meta 文件目录
+        start_date: 开始日期 'YYYY-MM-DD'
+        end_date: 结束日期 'YYYY-MM-DD'
+    
+    Returns:
+        合并后的 DataFrame，已去重
+    """
+    print(f"\n{'='*80}")
+    print(f"Loading meta data from {start_date} to {end_date}")
+    print(f"{'='*80}")
+    
+    meta_files = sorted(Path(meta_dir).glob('*.parquet'))
+    
+    all_meta = []
+    for file in tqdm(meta_files, desc="Loading meta files"):
+        date_str = file.stem  
+        file_date = pd.to_datetime(date_str, format='%Y%m%d')
+        
+        if pd.to_datetime(start_date) <= file_date <= pd.to_datetime(end_date):
+            df = pd.read_parquet(file)
+            all_meta.append(df)
+    
+    
+    # 合并所有 meta
+    meta_combined = pd.concat(all_meta, ignore_index=True)
+    
+    # 只保留有 call 的记录
+    meta_with_calls = meta_combined[meta_combined['EventId'].notna()].copy()
+    
+    # 去重：按 (EventId, Sedol_6, StartDateEST, LastUpdateEST) 去重
+    # 保留最早的 date（call 首次出现的日期）
+    #Deduplicating meta data
+    original_len = len(meta_with_calls)
+    
+    meta_with_calls = (
+        meta_with_calls
+        .sort_values('date')  # 按 date 排序
+        .drop_duplicates(
+            subset=['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST'],
+            keep='first'  # 保留最早的 date
+        )
+    )
+    
+    print(f"After dedup: {len(meta_with_calls):,}")
+    print(f"Removed: {original_len - len(meta_with_calls):,}")
+    
+    # 转换日期类型
+    meta_with_calls['date'] = pd.to_datetime(meta_with_calls['date'])
+    meta_with_calls['StartDateEST'] = pd.to_datetime(meta_with_calls['StartDateEST'])
+    meta_with_calls['LastUpdateEST'] = pd.to_datetime(meta_with_calls['LastUpdateEST'])
+    
+    return meta_with_calls
+
+
+# ============================================
+# STEP 2: LOAD AND MERGE EMBEDDINGS
+# ============================================
+
+def load_and_merge_embeddings(embedding_dir, start_date, end_date, version='all'):
+    """
+    加载并合并指定日期范围内的所有 embedding 文件
+    
+    Returns:
+        合并后的 DataFrame，已去重并按 call 聚合
+    """
+    print(f"\n{'='*80}")
+    print(f"Loading embeddings from {start_date} to {end_date}")
+    print(f"{'='*80}")
+    
+    emb_files = sorted(Path(embedding_dir).glob('*.parquet'))
+    
+    all_embeddings = []
+    for file in tqdm(emb_files, desc="Loading embedding files"):
+        date_str = file.stem
+        file_date = pd.to_datetime(date_str, format='%Y%m%d')
+        
+        if pd.to_datetime(start_date) <= file_date <= pd.to_datetime(end_date):
+            df = pd.read_parquet(file)
+            all_embeddings.append(df)
+    
+    
+    # 合并所有 embeddings
+    emb_combined = pd.concat(all_embeddings, ignore_index=True)
+    
+    # 去重：按 (EventId, Sedol_6, StartDateEST, LastUpdateEST, chunk_seq_id) 去重,一个call可能有多条，匹配在T和T+1（如果发生在0点到9：30之间）
+    #Deduplicating embeddings.
+    original_len = len(emb_combined)
+    
+    emb_combined = emb_combined.drop_duplicates(
+        subset=['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST', 'chunk_seq_id'],
+        keep='first'
+    )
+    
+    
+    # 按 call 聚合 chunks
+    emb_combined['StartDateEST'] = pd.to_datetime(emb_combined['StartDateEST'])
+    emb_combined['LastUpdateEST'] = pd.to_datetime(emb_combined['LastUpdateEST'])
+    
+    embedding_grouped = emb_combined.groupby(
+        ['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST']
+    ).apply(
+        lambda x: x[['chunk_seq_id', 'embedding']].to_dict('records')
+    ).reset_index(name='chunks')
+    
+    # print(f"Unique calls after grouping: {len(embedding_grouped):,}")
+    
+    # return embedding_grouped
+      # ✅ 新增：根据 version 参数选择
+    if version == 'first':
+        print(f"Keeping FIRST update per call...")
+        embedding_grouped = (
+            embedding_grouped
+            .sort_values('LastUpdateEST')
+            .drop_duplicates(subset=['EventId', 'Sedol_6', 'StartDateEST'], keep='first')
+        )
+    elif version == 'last':
+        print(f"Keeping LAST update per call...")
+        embedding_grouped = (
+            embedding_grouped
+            .sort_values('LastUpdateEST')
+            .drop_duplicates(subset=['EventId', 'Sedol_6', 'StartDateEST'], keep='last')
+        )
+    elif version == 'all':
+        print(f"Keeping ALL updates per call...")
+        # 不做额外去重
+        pass
+    else:
+        raise ValueError(f"Invalid version: {version}. Must be 'first', 'last', or 'all'")
+    
+    print(f"Unique calls after version selection: {len(embedding_grouped):,}")
+    
+    return embedding_grouped
+
+
+# ============================================
+# STEP 3: PREPARE UNIVERSE WITH FEATURES & TARGETS
+# ============================================
+
+def calculate_features_and_targets(df_univ):
+    """
+    计算 features 和 targets
+    """
+    print(f"\nCalculating features and targets...")
+    
+    df_univ = df_univ.sort_values(['Sedol_6', 'date'])
+    
+    # Target: [T-1, T, T+1] mean return
+    df_univ['target_ret'] = df_univ.groupby('Sedol_6', group_keys=False)['AdjSpecRet'].apply(
+        lambda x: (x.shift(1) + x + x.shift(-1)) / 3
+    )
+    
+    # Normalized target
+    EPS = 1e-8
+    df_univ['target_ret_norm'] = (
+        df_univ['target_ret'] / (df_univ['SpecRisk'] + EPS)
+    ).clip(lower=-5.0, upper=5.0)
+    
+    # Forward 60D return
+    df_univ['fwd_60d_ret'] = df_univ.groupby('Sedol_6', group_keys=False)['AdjSpecRet'].transform(
+        lambda x: x.shift(-2).rolling(window=60, min_periods=30).mean()
+    )
+    
+    # Features
+    # df_univ['EPS_ActualValue_Adj'] = (df_univ['IB0_QTR_EPS_ActualValue'] * df_univ['AdjFactor'])
+    # df_univ['EPS_SurpriseMean_Adj'] = (df_univ['IB0_QTR_EPS_SurpriseMean'] * df_univ['AdjFactor'])
+    # df_univ['EPS_Surprise'] = (df_univ['EPS_ActualValue_Adj'] - df_univ['EPS_SurpriseMean_Adj'])
+    # df_univ['Revenue_Surprise'] = (df_univ['IB0_QTR_SAL_ActualValue'] - df_univ['IB0_QTR_SAL_SurpriseMean'])
+    # df_univ['LogMktCap'] = np.log(df_univ['MktCap'] + 1)
+    
+    print(f"Finish features and targets calculation")
+    
+    return df_univ
+
+def winsorize_features(df_univ, earnings_features, train_end, l_clip=0.0005, h_clip=0.9995):
+    """
+    基于训练集进行 winsorization
+    """
+
+    train_df = df_univ[df_univ['date'] <= train_end].copy()
+    financial_features = []
+    
+    for col in earnings_features:
+        # 检查列是否存在
+        if col not in df_univ.columns:
+            print(f"warning: {col} not in universe, skipping")
+            continue
+        
+        # 计算 clip thresholds
+        lower = train_df[col].quantile(l_clip)
+        upper = train_df[col].quantile(h_clip)
+        
+        # 创建 clipped 列
+        clipped_col = col + '_clipped'
+        df_univ[clipped_col] = df_univ[col].clip(lower, upper)
+        
+        # 填充缺失值（用训练集的 median）
+        median_val = train_df[col].median()
+        df_univ[clipped_col] = df_univ[clipped_col].fillna(median_val)
+        
+        financial_features.append(clipped_col)
+    print(f"\n{'='*80}")
+    print(f"winsorization completed")
+    print(f"\n{'='*80}")
+    
+    return df_univ, financial_features
+
+
+
+def merge_data_for_training(meta_df, embedding_df, univ_df, financial_features, cut_hour=9, cut_minutes=30):
+    """
+    合并 meta, universe, embeddings 生成训练数据
+    """
+    print(f"\n{'='*80}")
+    print(f"Merging meta + universe + embeddings")
+    print(f"{'='*80}")
+    
+    # Step 1: 计算 meta 对应的 universe date
+    print(f"Mapping StartDateEST to universe date...")
+    print(f"  Meta records: {len(meta_df):,}")
+    
+    meta_df = meta_df.copy()
+    meta_df['StartDateEST'] = pd.to_datetime(meta_df['StartDateEST'])
+    
+    # 提取日期和时间
+    meta_df['call_date'] = meta_df['StartDateEST'].dt.normalize()
+    meta_df['call_hour'] = meta_df['StartDateEST'].dt.hour
+    meta_df['call_minute'] = meta_df['StartDateEST'].dt.minute
+    
+    # 获取所有交易日（从 universe）
+    trading_dates = sorted(univ_df['date'].unique())
+    #trading_dates_map = {date: i for i, date in enumerate(trading_dates)}
+    
+    def get_universe_date(row):
+        """
+        根据 StartDateEST 计算对应的 universe date
+        - [00:00, 9:30): 使用前一个交易日
+        - [9:30, 24:00): 使用当天
+        """
+        call_date = row['call_date']
+        call_hour = row['call_hour']
+        call_minute = row['call_minute']
+        
+        # 判断是否在 9:30 之前
+        if call_hour < cut_hour or (call_hour == cut_hour and call_minute < cut_minutes):
+            prev_dates = [d for d in trading_dates if d < call_date]
+            if prev_dates:
+                return prev_dates[-1]
+            else:
+                return call_date - pd.offsets.BDay(1)
+        else:
+            # 使用当天
+            return call_date
+    
+    meta_df['univ_date'] = meta_df.apply(get_universe_date, axis=1)
+    
+    # # 统计
+    # before_16 = (meta_df['call_hour'] < 16).sum()
+    # after_16 = (meta_df['call_hour'] >= 16).sum()
+    # print(f"  Calls before 16:00: {before_16:,} (use same day)")
+    # print(f"  Calls after 16:00: {after_16:,} (use next trading day)")
+    
+    # 过滤掉无法匹配的
+    meta_df = meta_df[meta_df['univ_date'].notna()].copy()
+    print(f"  After filtering: {len(meta_df):,} records")
+    
+    # Step 2: Meta + Universe
+    print(f"\n Merging meta with universe...")
+    print(f"  Universe records: {len(univ_df):,}")
+    
+    # ✅ 修复：先选择需要的列，避免列名冲突
+    meta_cols_to_keep = [
+        'date', 'EventId', 'Sedol_6', 'PointID', 
+        'StartDateEST', 'LastUpdateEST', 'univ_date'
+    ]
+    meta_for_merge = meta_df[meta_cols_to_keep].copy()
+
+    # print(f"  Checking sample meta:")
+    # print(meta_for_merge.head())
+    # print(f"\n  Checking sample univ:")
+    # print(univ_df[['date', 'PointID', 'Sedol_6']].head())
+
+    # Merge: meta.univ_date = univ.date
+    merged = meta_for_merge.merge(
+        univ_df,
+        left_on=['univ_date', 'PointID', 'Sedol_6'],
+        right_on=['date', 'PointID', 'Sedol_6'],
+        how='left',
+        suffixes=('_meta', '_univ')  # ✅ 添加后缀避免冲突
+    )
+    #merged.to_parquet('merged.parquet')
+    # print(f"\n  Checking sample merged:")
+    # print(merged.head())
+    # ✅ 检查未匹配的记录
+    n_unmatched = merged['date_univ'].isna().sum()
+    if n_unmatched > 0:
+        print(f"\n WARNING: univ_df less than meta, {n_unmatched}/{len(merged)} records not matched with meta")
+
+    # ✅ 修复：重命名列，保持一致性
+    # merged = merged.rename(columns={
+    #     'date_meta': 'meta_date',  # meta 的 date（call 首次出现日期）(0~930前一天，930到24当天)
+    #     'date_univ': 'date'        # universe 的 date（用于 features）
+    # })
+    merged = merged.rename(columns={
+        'date_meta': 'date'#,  # meta 的 date（call 首次出现日期）(0~930前一天，930到24当天)
+       # 'date_univ': 'date_univ'        # universe 的 date（用于 features）
+    })
+    print(f"  After merge: {len(merged):,} records")
+    
+    if len(merged) == 0:
+        print(f"\n WARNING: No records after merging meta with universe!")
+        # print(f"  Checking sample meta dates:")
+        # print(meta_df[['Sedol_6', 'StartDateEST', 'univ_date']].head())
+        # print(f"\n  Checking sample universe dates:")
+        # print(univ_df[['Sedol_6', 'date']].head())
+        return pd.DataFrame()
+    
+    # Step 3: Add embeddings
+    print(f"\n Merging with embeddings...")
+    print(f"  Embedding calls: {len(embedding_df):,}")
+    
+    merged = merged.merge(
+        embedding_df,
+        on=['EventId', 'Sedol_6', 'StartDateEST', 'LastUpdateEST'],
+        how='left'
+    )
+    n_unmatched2 = merged['chunks'].isna().sum()
+    if n_unmatched2 > 0:
+        print(f"\n WARNING: embedding less than meta, {n_unmatched2}/{len(merged)} records not matched with meta")
+
+    print(f"  After merge: {len(merged):,} records")
+    
+    if len(merged) == 0:
+        print(f"\n WARNING: No records after merging with embeddings!")
+        return pd.DataFrame()
+    
+    # Step 4: Filter valid samples
+    print(f"\n Filtering valid samples...")
+    valid_mask = (
+        merged['target_ret_norm'].notna() &
+        merged['chunks'].notna()
+    )
+    
+    merged_valid = merged[valid_mask].copy()
+    
+    print(f"  Valid samples: {len(merged_valid):,}")
+  #  print(f"  Unique calls: {merged_valid['EventId'].nunique():,}")
+    
+    if len(merged_valid) == 0:
+        print(f"\n WARNING: No valid samples!")
+        return pd.DataFrame()
+    
+    # Step 5: Select required columns
+    required_cols = (
+        ['date', 'EventId', 'Sedol_6', 'PointID', 
+         'StartDateEST', 'LastUpdateEST', 'date_univ'] +
+        financial_features +
+        ['target_ret_norm', 'fwd_60d_ret', 'chunks']
+    )
+    
+    merged_valid = merged_valid[required_cols].copy()
+    
+    return merged_valid
+
+# ============================================
+# STEP 5: DATASET & DATALOADER
+# ============================================
+
+class CallEarningsDataset(Dataset):
+    def __init__(self, df, financial_features):
+        self.df = df.reset_index(drop=True)
+        self.financial_features = financial_features
+        self.features_array = self.df[financial_features].to_numpy(dtype=np.float32)
+        self.targets_array = self.df['target_ret_norm'].to_numpy(dtype=np.float32)
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        chunks = row['chunks']
+        embeddings = [np.array(c['embedding'], dtype=np.float32) for c in chunks]
+        embeddings = torch.from_numpy(np.stack(embeddings))
+        features = torch.from_numpy(self.features_array[idx])
+        target = torch.tensor(self.targets_array[idx], dtype=torch.float32)
+        
+        return {
+            'embeddings': embeddings,
+            'features': features,
+            'target': target,
+            'fwd_60d_ret': row['fwd_60d_ret'],
+            'n_chunks': len(embeddings),
+            'date': row['date'],
+            'Sedol_6': row['Sedol_6'],
+            'PointID': row['PointID'],
+            'EventId': row['EventId'],
+            'StartDateEST': row['StartDateEST'],
+            'LastUpdateEST': row['LastUpdateEST']
+        }
+
+
+def collate_fn(batch):
+    max_chunks = max([item['n_chunks'] for item in batch])
+    embeddings_padded = []
+    masks = []
+    features = []
+    targets = []
+    fwd_60d_ret = []
+    dates = []
+    Sedol_6 = []
+    PointID = []
+    EventId = []
+    StartDateEST = []
+    LastUpdateEST = []
+
+    for item in batch:
+        emb = item['embeddings']
+        N = emb.shape[0]
+        
+        if N < max_chunks:
+            padding = torch.zeros(max_chunks - N, 768)
+            emb_padded = torch.cat([emb, padding], dim=0)
+            mask = torch.cat([torch.ones(N), torch.zeros(max_chunks - N)])
+        else:
+            emb_padded = emb
+            mask = torch.ones(N)
+        
+        embeddings_padded.append(emb_padded)
+        masks.append(mask)
+        features.append(item['features'])
+        targets.append(item['target'])
+        fwd_60d_ret.append(item['fwd_60d_ret'])
+        dates.append(item['date'])
+        Sedol_6.append(item['Sedol_6'])
+        PointID.append(item['PointID'])
+        EventId.append(item['EventId'])
+        StartDateEST.append(item['StartDateEST'])
+        LastUpdateEST.append(item['LastUpdateEST'])
+    
+    return {
+        'embeddings': torch.stack(embeddings_padded),
+        'masks': torch.stack(masks),
+        'features': torch.stack(features),
+        'targets': torch.stack(targets),
+        'fwd_60d_ret': torch.tensor(fwd_60d_ret, dtype=torch.float32),
+        'dates': dates,
+        'Sedol_6': Sedol_6,
+        'PointID': PointID,
+        'EventId': EventId,
+        'StartDateEST': StartDateEST,
+        'LastUpdateEST': LastUpdateEST
+    }
+
+
+# ============================================
+# STEP 6: MODEL
+# ============================================
+
+class TextConditionalLinearModel(nn.Module):
+    def __init__(self, embed_dim=768, coeff_hidden_dim=128, attn_hidden_dim=256, coeff_dropout=0.2):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        self.attention = nn.Sequential(
+            nn.Linear(embed_dim, attn_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(attn_hidden_dim, 1)
+        )
+        
+        self.coeff_net = nn.Sequential(
+            nn.Linear(embed_dim, coeff_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(coeff_dropout),
+            nn.Linear(coeff_hidden_dim, 1)
+        )
+        
+        nn.init.xavier_uniform_(self.coeff_net[-1].weight, gain=0.01)
+        nn.init.zeros_(self.coeff_net[-1].bias)
+        
+    def forward(self, embeddings, masks):
+        B, N, D = embeddings.shape
+        
+        attn_scores = self.attention(embeddings).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(masks == 0, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=1)
+        
+        z_call = torch.bmm(
+            attn_weights.unsqueeze(1),
+            embeddings
+        ).squeeze(1)
+        
+        predictions = self.coeff_net(z_call).squeeze(-1)
+        
+        return predictions, attn_weights, z_call
+
+
+# ============================================
+# STEP 7: TRAINING & EVALUATION
+# ============================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0
+    
+    pbar = tqdm(loader, desc='Training', leave=False)
+    for batch in pbar:
+        embeddings = batch['embeddings'].to(device)
+        masks = batch['masks'].to(device)
+        targets = batch['targets'].to(device)
+        
+        predictions, _, _ = model(embeddings, masks)
+        loss = F.mse_loss(predictions, targets)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        total_loss += loss.item()
+        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+    
+    return {'loss': total_loss / len(loader)}
+
+
+def evaluate_with_daily_ic(model, loader, device, eval_version='all'):
+    model.eval()
+    
+    all_preds = []
+    all_targets = []
+    all_fwd_60d_ret = []
+    all_dates = []
+    all_sedols = []
+    all_PointIDs = []
+    all_EventIds = []
+    all_StartDateEST = []
+    all_LastUpdateEST = []
+    all_attn_weights = []
+    all_z_calls = []
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc='Evaluating', leave=False):
+            embeddings = batch['embeddings'].to(device)
+            masks = batch['masks'].to(device)
+            targets = batch['targets'].to(device)
+            
+            predictions, attn_weights, z_call = model(embeddings, masks)
+            
+            all_preds.extend(predictions.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+            all_fwd_60d_ret.extend(batch['fwd_60d_ret'].cpu().numpy())
+            all_dates.extend(batch['dates'])
+            all_sedols.extend(batch['Sedol_6'])
+            all_PointIDs.extend(batch['PointID'])
+            all_EventIds.extend(batch['EventId'])
+            all_StartDateEST.extend(batch['StartDateEST'])
+            all_LastUpdateEST.extend(batch['LastUpdateEST'])
+            all_attn_weights.extend(attn_weights.cpu().numpy())
+            all_z_calls.extend(z_call.cpu().numpy())
+
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    
+
+    
+    results_df = pd.DataFrame({
+        'pred': all_preds,
+        'target': all_targets,
+        'fwd_60d_ret': all_fwd_60d_ret,
+        'pred_date': pd.to_datetime(all_dates),
+        'Sedol_6': all_sedols,
+        'PointID': all_PointIDs,
+        'EventId': all_EventIds,
+        'StartDateEST': all_StartDateEST,
+        'LastUpdateEST': all_LastUpdateEST,
+        'attn_weights': all_attn_weights,
+        'aggregated_embeddings': all_z_calls,
+    })
+
+    print(f"\nEvaluation version strategy: {eval_version}")
+    original_len = len(results_df)
+    
+    if eval_version == 'first':
+        results_df = (
+            results_df
+            .sort_values('LastUpdateEST')
+            .drop_duplicates(subset=['EventId', 'Sedol_6', 'StartDateEST'], keep='first')
+        )
+    elif eval_version == 'last':
+        results_df = (
+            results_df
+            .sort_values('LastUpdateEST')
+            .drop_duplicates(subset=['EventId', 'Sedol_6', 'StartDateEST'], keep='last')
+        )
+    elif eval_version == 'all':
+        # 使用所有版本
+        pass
+    else:
+        raise ValueError(f"Invalid eval_version: {eval_version}")
+
+    mse = np.mean((all_preds - all_targets) ** 2)
+    rmse = np.sqrt(mse)
+    
+    # Daily IC
+    daily_ics = results_df.groupby('pred_date', group_keys=False).apply(
+        lambda x: x['pred'].corr(x['target'], method='spearman') if len(x) >= 10 else np.nan
+    ).dropna()
+
+    mean_ic = daily_ics.mean()
+    ic_std = daily_ics.std()
+    ic_ir = mean_ic / ic_std if ic_std > 0 else 0
+    
+    # Global correlations
+    global_pearson = results_df['pred'].corr(results_df['target'], method='pearson')
+    global_spearman = results_df['pred'].corr(results_df['target'], method='spearman')
+    r_squared = r2_score(results_df['target'], results_df['pred'])
+    
+    # Forward 60D IC
+    valid_fwd = results_df[results_df['fwd_60d_ret'].notna()].copy()
+    daily_ics_fwd = valid_fwd.groupby('pred_date', group_keys=False).apply(
+        lambda x: x['pred'].corr(x['fwd_60d_ret'], method='spearman') if len(x) >= 10 else np.nan
+    ).dropna()
+
+    mean_ic_fwd = daily_ics_fwd.mean()
+    global_spearman_fwd = valid_fwd['pred'].corr(valid_fwd['fwd_60d_ret'], method='spearman')
+    
+    return {
+        'mse': mse,
+        'rmse': rmse,
+        'mean_daily_ic': mean_ic,
+        'ic_std': ic_std,
+        'ic_ir': ic_ir,
+        'daily_ics': daily_ics,
+        'global_pearson': global_pearson,
+        'global_spearman': global_spearman,
+        'r_squared': r_squared,
+        'mean_daily_ic_60D': mean_ic_fwd,
+        'global_spearman_60D': global_spearman_fwd,
+        'results_df': results_df
+    }
+
+
+
+# ============================================
+# MAIN PIPELINE
+# ============================================
+
+def main(config):
+    META_DIR = config['meta_dir']
+    EMBEDDING_DIR = config['embedding_dir']
+    UNIVERSE_PATH = config['universe_path']
+    OUTPUT_DIR = config['output_dir']
+    
+    TRAIN_START = config['train_start']
+    TRAIN_END = config['train_end']
+    TEST_START = config['test_start']
+    TEST_END = config['test_end']
+    
+    SEED = config['seed']
+    LEARNING_RATE = config['learning_rate']
+    N_EPOCHS = config['n_epochs']
+    BATCH_SIZE = config['batch_size']
+    
+    UPDATE_VERSION_TRAIN = config['update_version_train']
+    UPDATE_VERSION_EVAL = config['update_version_eval']
+    
+    earnings_features = config['earnings_features']
+    
+    # 创建输出目录
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'#'*80}")
+    print(f"# PRODUCTION MODEL TRAINING & TESTING")
+    print(f"# Seed: {SEED}")
+    print(f"{'#'*80}\n")
+    
+    set_seed(SEED)
+    
+    # Step 1: Load meta data
+    train_meta = load_and_merge_meta(META_DIR, TRAIN_START, TRAIN_END)
+    test_meta = load_and_merge_meta(META_DIR, TEST_START, TEST_END)
+    
+    # Step 2: Load embeddings
+    train_embeddings = load_and_merge_embeddings(EMBEDDING_DIR, TRAIN_START, TRAIN_END, version=UPDATE_VERSION_TRAIN)
+    test_embeddings = load_and_merge_embeddings(EMBEDDING_DIR, TEST_START, TEST_END, version='all')
+    
+    # Step 3: Prepare universe (加载完整的 universe，不要过滤日期)
+    print(f"\n{'='*80}")
+    print(f"Loading universe data")
+    print(f"{'='*80}")
+    
+    # univ_df = pd.read_parquet(UNIVERSE_PATH)
+    # univ_df['date'] = pd.to_datetime(univ_df['date'])
+    univ_df = load_universe(UNIVERSE_PATH)
+    univ_start = pd.to_datetime(TRAIN_START) - pd.offsets.BDay(1)
+    univ_df = univ_df[(univ_df['date'] >= univ_start)].copy()
+    
+    # ✅ 修改：不要在这里过滤日期，因为需要完整的交易日历
+    print(f"Universe records: {len(univ_df):,}")
+    print(f"Date range: {univ_df['date'].min()} to {univ_df['date'].max()}")
+    
+    # Sedol_6
+    univ_df['Sedol_6'] = (
+        univ_df['Sedol'].astype(str).str.strip().str.upper().str[:6]
+    )
+    
+    # 计算 features 和 targets
+    univ_df = calculate_features_and_targets(univ_df)
+    
+    # Step 4: Winsorize features
+    univ_df, financial_features = winsorize_features(univ_df, earnings_features, TRAIN_END)
+    
+    # Step 5: Merge data
+    print(f"\n{'='*80}")
+    print(f"Preparing training data")
+    print(f"{'='*80}")
+    
+    train_df = merge_data_for_training(
+        train_meta,
+        train_embeddings,
+        univ_df,  
+        financial_features
+    )
+    
+    print(f"\n{'='*80}")
+    print(f"Preparing testing data")
+    print(f"{'='*80}")
+    
+    test_df = merge_data_for_training(
+        test_meta,
+        test_embeddings,
+        univ_df,  
+        financial_features
+    )
+    
+    # ✅ 添加：检查是否有数据
+    if len(train_df) == 0:
+        raise ValueError("Training data is empty! Check merge logic.")
+    
+    if len(test_df) == 0:
+        raise ValueError("Testing data is empty! Check merge logic.")
+    
+    print(f"\n{'='*80}")
+    print(f"  Training: {len(train_df):,} samples")
+    print(f"  Testing: {len(test_df):,} samples")
+    print(f"{'='*80}\n")
+    
+    # Step 6: Create datasets
+    train_dataset = CallEarningsDataset(train_df, financial_features)
+    test_dataset = CallEarningsDataset(test_df, financial_features)
+    
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=BATCH_SIZE,
+    #     shuffle=True,
+    #     collate_fn=collate_fn,
+    #     num_workers=0,
+    #     generator=torch.Generator().manual_seed(SEED)
+    # )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=64,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+    
+    # Step 7: Train model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}\n")
+    
+    model = TextConditionalLinearModel(
+        embed_dim=768,
+        coeff_hidden_dim=128,
+        attn_hidden_dim=256,
+        coeff_dropout=0.2
+    ).to(device)
+    
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-3
+    )
+    
+    print(f"{'='*80}")
+    print(f"Training model...")
+    print(f"{'='*80}\n")
+    
+    experiment_id = 0
+    for epoch in range(N_EPOCHS):
+        experiment_id += 1
+        print(f"Epoch {epoch+1}/{N_EPOCHS}")
+        train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+        generator=torch.Generator().manual_seed(SEED + experiment_id)
+        )
+        train_metrics = train_epoch(model, train_loader, optimizer, device)
+        print(f"Train Loss: {train_metrics['loss']:.6f}\n")
+    
+    # Step 8: Evaluate
+    print(f"{'='*80}")
+    print(f"Evaluating on test set...")
+    print(f"{'='*80}\n")
+    
+    test_metrics = evaluate_with_daily_ic(model, test_loader, device, eval_version=UPDATE_VERSION_EVAL)
+    
+    # Step 9: Save results
+    results_df = test_metrics['results_df']
+    output_path = f"{OUTPUT_DIR}/production_results_train{UPDATE_VERSION_TRAIN}_eval{UPDATE_VERSION_EVAL}_{N_EPOCHS}_{LEARNING_RATE}.parquet"
+    results_df.to_parquet(output_path, index=False)
+    
+    print(f"\n{'='*80}")
+    print(f"Test Set Performance")
+    print(f"{'='*80}")
+    print(f"MSE:                    {test_metrics['mse']:.6f}")
+    print(f"RMSE:                   {test_metrics['rmse']:.6f}")
+    print(f"Mean Daily IC:          {test_metrics['mean_daily_ic']:.6f}")
+    print(f"Daily IC Std:           {test_metrics['ic_std']:.6f}")
+    print(f"Daily IC IR:            {test_metrics['ic_ir']:.6f}")
+    print(f"Global Pearson:         {test_metrics['global_pearson']:.6f}")
+    print(f"Global Spearman:        {test_metrics['global_spearman']:.6f}")
+    print(f"R Squared:              {test_metrics['r_squared']:.6f}")
+    print(f"Mean Daily IC (60D):    {test_metrics['mean_daily_ic_60D']:.6f}")
+    print(f"Global Spearman (60D):  {test_metrics['global_spearman_60D']:.6f}")
+    print(f"{'='*80}\n")
+    
+    print(f"✅ Results saved to: {output_path}")
+    
+    # Save model
+    # model_path = f"{OUTPUT_DIR}/production_model_{SEED}.pth"
+    # torch.save(model.state_dict(), model_path)
+    # print(f"✅ Model saved to: {model_path}")
+
+
+#last all
+config = {
+    # Paths
+    'meta_dir': '/data09/home/aw_shared/prod/daily_meta_embedding/meta',
+    'embedding_dir': '/data09/home/aw_shared/prod/daily_meta_embedding/embeddings',
+    'universe_path': '/data09/home/aw_shared/prod/univ_merged',
+    #'/data09/home/aw_shared/prod/univ_merged/univ_merged.parquet',
+    'output_dir': '/data09/home/aw_shared/prod/model_results',
+    
+    #Training parameters
+    'train_start': '2015-01-01',
+    'train_end': '2022-12-31',
+    'test_start': '2023-01-01',
+    'test_end': '2026-02-06', #'2025-12-29',
+    # 'train_start': '2015-01-01',
+    # 'train_end': '2016-12-31',
+    # 'test_start': '2023-01-01',
+    # 'test_end': '2025-12-29',
+    
+    # Model parameters
+    'seed': 42,
+    'learning_rate': 0.00001,#0.0001,
+    'n_epochs': 2,#6,
+    'batch_size': 32,
+    
+    # Version control
+    'update_version_train': 'last',  # 'first', 'last', 'all'
+    'update_version_eval': 'all',   # 'first', 'last', 'all'
+    
+    # Features
+    'earnings_features': [
+        # 'EPS_Surprise', 'Revenue_Surprise', 'EPS_SurpriseMean_Adj',
+        # 'IB0_QTR_SAL_SurpriseMean', 'YOY_OEPS_G', 'YOY_SAL_G',
+        # 'YOY_CPS_G', 'YOY_EPS_EG', 'YOY_SAL_EG', 'IB0_QTR1_EPS_Mean',
+        # 'LogMktCap',
+          'DlyReturn', 'AdjSpecRet'
+    ] 
+}
+
+main(config)
